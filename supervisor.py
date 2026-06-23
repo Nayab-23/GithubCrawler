@@ -1,12 +1,12 @@
 """
-supervisor.py — long-running watchdog for the GitHub crawler on the Pi.
+supervisor.py — long-running watchdog for the verification document crawler.
 
 Lifecycle:
   1. Launch run_local.sh as a subprocess.
   2. Every 60 s check crawl.log — if the last line has not changed in
      10 minutes, treat the crawler as stalled: kill it and restart.
   3. After a clean exit, merge /tmp/results_local_run.csv into
-     results_local.csv (deduplicating on username+repo).
+     results_local.csv (deduplicating on query+url+local_path).
   4. Sleep for SLEEP_BETWEEN seconds, then go back to step 1.
 
 Run with:
@@ -82,17 +82,18 @@ def _last_log_line():
 # ---------------------------------------------------------------------------
 
 def _load_seen_keys(path):
-    """Return set of (username, repo) tuples from an existing CSV."""
+    """Return set of (query, url, local_path) tuples from an existing CSV."""
     seen = set()
     if not os.path.exists(path):
         return seen
     try:
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                u = row.get("username", "").strip()
-                r = row.get("repo", "").strip()
-                if u and r:
-                    seen.add((u, r))
+                q = row.get("query", "").strip()
+                u = row.get("url", "").strip()
+                p = row.get("local_path", "").strip()
+                if q or u or p:
+                    seen.add((q, u, p))
     except Exception as exc:
         slog(f"[warn] could not read existing results: {exc}")
     return seen
@@ -101,7 +102,7 @@ def _load_seen_keys(path):
 def merge_results(log_noop=False):
     """
     Append rows from RESULTS_TMP into RESULTS_FINAL, skipping any
-    (username, repo) pair already present in RESULTS_FINAL.
+    (query, url, local_path) tuple already present in RESULTS_FINAL.
     Returns number of new rows written.
     """
     if not os.path.exists(RESULTS_TMP):
@@ -118,7 +119,11 @@ def merge_results(log_noop=False):
             reader = csv.DictReader(f)
             fieldnames = reader.fieldnames or []
             for row in reader:
-                key = (row.get("username", "").strip(), row.get("repo", "").strip())
+                key = (
+                    row.get("query", "").strip(),
+                    row.get("url", "").strip(),
+                    row.get("local_path", "").strip(),
+                )
                 if key not in seen:
                     new_rows.append(row)
                     seen.add(key)

@@ -1,127 +1,179 @@
-# GitHub Crawler
+# Verification Document Crawler
 
-Searches GitHub commits and issues for developers experiencing merge conflict pain, enriches each lead with GitHub profile and repo metadata, and outputs a prioritised CSV ranked by signal strength. Designed to run distributed across multiple lab PCs coordinated from a Raspberry Pi.
+This repo crawls verification-related material instead of GitHub developer leads.
 
----
+Primary target categories:
 
-## Requirements
+- IEEE SystemVerilog references
+- SVA tutorials and rulebooks
+- Protocol specifications
+- Design and microarchitecture specs
+- Prior generated assertions and checker examples
+- Formal logs, proofs, and counterexamples
+- HIL correction notes
+- RCA and postmortem reports
+- Related verification plans, coverage reports, UVM references, and errata
 
-- Python 3.8+ on the Raspberry Pi and each lab PC
-- SSH access from the Pi to each lab PC (passwordless after setup)
-- One GitHub personal access token per lab PC (classic tokens with `read:user` and `public_repo` scopes)
+The crawler combines:
 
----
+- web discovery through Bing RSS search
+- domain-focused queries for `ieeexplore.ieee.org`, `verificationacademy.com`, `accellera.org`, `github.com`, and PDF-heavy results
+- optional local document indexing through `LOCAL_DOC_DIRS` for internal specs, logs, rulebooks, and reports
 
-## Setup
+## How It Works
 
-### 1. Clone the repo onto the Raspberry Pi
+For each query in `queries.txt`, the crawler:
+
+1. searches the web across the configured source presets
+2. scans local directories from `LOCAL_DOC_DIRS`
+3. classifies each hit into a document type
+4. scores and filters results
+5. writes incremental CSV snapshots
+
+The main output is `final_leads.csv`, which is now a ranked document inventory rather than a contact-lead file.
+
+## Raspberry Pi Setup
+
+Recommended target:
+
+- Raspberry Pi 4 or newer
+- Python 3.10+
+- always-on network connection
+- enough local storage for logs and CSV history
+
+Clone and set up the repo:
 
 ```bash
-git clone <repo-url> github-crawler
-cd github-crawler
-```
-
-### 2. Install dependencies
-
-```bash
+git clone https://github.com/Nayab-23/GithubCrawler.git
+cd GithubCrawler
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 3. Configure environment
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env` and fill in:
+## Configuration
 
-| Variable | Description |
-|---|---|
-| `PC_IPS` | Comma-separated IP addresses of lab PCs |
-| `PC_USER` | SSH username on each lab PC |
-| `GITHUB_TOKENS` | One token per PC, in the same order as `PC_IPS` |
-| `QUERIES_FILE` | Path to `queries.txt` (default: `./queries.txt`) |
-| `RESULTS_DIR` | Directory where per-PC CSVs are collected (default: `./results`) |
-| `OUTPUT_FILE` | Final merged output path (default: `./final_leads.csv`) |
-
-### 4. Push SSH keys and deploy crawler to each PC
+Minimal `.env` for local continuous crawling:
 
 ```bash
-./setup_coordinator.sh
+QUERIES_FILE=./queries.txt
+RESULTS_DIR=./results
+OUTPUT_FILE=./final_leads.csv
+LOCAL_DOC_DIRS=/home/nayab/specs,/home/nayab/logs,/home/nayab/assertions,/home/nayab/rca
+MAX_WEB_RESULTS_PER_QUERY=8
+MAX_LOCAL_RESULTS_PER_QUERY=12
+SEARCH_DELAY_SECONDS=1.0
+MIN_PRIORITY_SCORE=6
+POLL_INTERVAL_SECONDS=60
+STALL_TIMEOUT_SECONDS=600
+SLEEP_BETWEEN_SECONDS=3600
 ```
 
-This generates `~/.ssh/id_rsa` if needed, runs `ssh-copy-id` to each PC (prompts for password once per PC), and SCPs `crawler.py` to `/tmp/crawler.py` on each machine.
+Key variables:
 
----
+- `LOCAL_DOC_DIRS`: comma-separated directories containing internal specs, rulebooks, logs, assertions, RCAs, and similar artifacts
+- `SEARCH_DELAY_SECONDS`: delay between external web requests
+- `MIN_PRIORITY_SCORE`: low-quality result cutoff
+- `SLEEP_BETWEEN_SECONDS`: delay between full crawl cycles when using `supervisor.py`
 
-## Running
+`LOCAL_DOC_DIRS` is the most important setting for internal verification material.
+
+## Running Once
+
+Run a single local crawl:
+
+```bash
+./run_local.sh
+```
+
+Run the multi-machine coordinator flow:
 
 ```bash
 ./run_crawl.sh
 ```
 
-Or directly:
+The coordinator still splits `queries.txt` across machines, uploads `crawler.py`, runs it remotely, and merges the returned CSV files.
+
+## Running Continuously
+
+For Raspberry Pi use, the intended continuous entrypoint is:
 
 ```bash
-python3 coordinator.py
+. .venv/bin/activate
+python supervisor.py
 ```
 
-The coordinator:
-1. Splits `queries.txt` evenly across all PCs
-2. SSHs into each PC in parallel and runs the crawler
-3. Polls every 60 seconds until all crawlers finish (timeout: 4 hours)
-4. SCPs result CSVs back to `RESULTS_DIR`
-5. Runs `merge_results.py` to deduplicate, score, and produce the final output
+Or install it as a systemd service:
 
----
+```bash
+chmod +x install_service.sh
+./install_service.sh
+```
+
+Useful commands after installation:
+
+```bash
+sudo systemctl status githubcrawler
+sudo systemctl restart githubcrawler
+tail -f supervisor.log
+tail -f crawl.log
+```
+
+## Should It Run 24/7?
+
+Yes, it can run continuously on a Raspberry Pi, but it should not scrape aggressively in a tight loop.
+
+Recommended approach:
+
+- run `supervisor.py` continuously
+- set `SLEEP_BETWEEN_SECONDS` to something sensible like `1800` or `3600`
+- keep `SEARCH_DELAY_SECONDS` at `1.0` or higher
+- let local document crawling do most of the heavy lifting
+
+Practical guidance:
+
+- `24/7` is fine for periodic refresh cycles
+- `24/7 full-speed nonstop` is not a good idea
+- external search quality will not improve much from hammering the web every minute
+- local/internal document discovery benefits more from stable repeated indexing than from high request volume
+
+Start with hourly cycles:
+
+```bash
+SLEEP_BETWEEN_SECONDS=3600
+```
+
+If you later need fresher results, reduce to:
+
+```bash
+SLEEP_BETWEEN_SECONDS=900
+```
+
+I would not recommend a zero-sleep infinite loop on a Pi for this workload.
 
 ## Output
 
-**`final_leads.csv`** contains one row per unique `(username, repo)` lead with the following fields:
+The CSV contains document-centric fields such as:
 
-| Field | Description |
-|---|---|
-| `query` | The search query that surfaced this lead |
-| `source_type` | `commit`, `issue`, or `pr` |
-| `repo` / `repo_name` | Full repo path and short name |
-| `org` / `org_type` | Owner login and whether it's a `User` or `Organization` |
-| `contributor_count` | Number of contributors to the repo |
-| `language` | Primary repo language |
-| `stars` | Repo star count |
-| `username` | GitHub username |
-| `display_name`, `email`, `company`, `bio`, `location` | GitHub profile fields |
-| `github_profile`, `linkedin`, `twitter`, `blog` | Contact/social links |
-| `commit_message` / `commit_url` / `commit_date` | Source commit or issue details |
-| `priority_score` | Integer score (see below) |
-| `priority` | `P1`, `P2`, or `P3` |
+- `document_type`
+- `title`
+- `source_name`
+- `source_domain`
+- `url`
+- `local_path`
+- `file_type`
+- `matched_keywords`
+- `snippet`
+- `published_hint`
+- `priority_score`
+- `priority`
 
-### Priority tiers
+Higher scores are given to strong matches such as IEEE references, protocol specs, design specs, formal logs, assertion examples, and local internal documents.
 
-| Label | Score | Meaning |
-|---|---|---|
-| **P1** | ≥ 8 | High-signal lead — strong repo fit, contact info present, relevant query |
-| **P2** | 5–7 | Good lead — worth reaching out |
-| **P3** | < 5 | Weak signal — low-fit repo or sparse profile |
+## Current Limitations
 
-Scoring bonuses include: contributor count in the 5–50 sweet spot (+3), email/LinkedIn present (+2 each), org account (+2), hardware language like VHDL/Verilog (+3), systems language like C/C++/Rust (+2), and high-pain queries like "merge conflict" or "synthesis error" (+2).
-
-Leads are filtered before output: bots and CI accounts are removed, and repos with fewer than 3 or more than 500 contributors are excluded.
-
----
-
-## Rate Limits
-
-GitHub enforces **30 search requests/minute** and **5,000 API calls/hour** per token. With 4 PCs each using a separate token:
-
-- **120 search requests/minute** combined
-- **20,000 API calls/hour** combined
-
-The crawler enforces a 2.1-second delay between every API call per token to stay safely within limits. If a 403 rate-limit response is received, the crawler reads the `X-RateLimit-Reset` header and sleeps until the window resets.
-
----
-
-## A Note on Language Filtering
-
-GitHub's `language:` filter **only works with code search** (`/search/code`), not with commit or issue search. Applying it to commit or issue queries silently returns zero results.
-
-This crawler intentionally omits `language:` from all queries and instead filters by language **after enrichment**, using the primary language field from each repo's metadata. This means you get full result coverage and can filter to any language in post-processing.
+- IEEE documents may resolve only to metadata or abstract pages when the full content is paywalled.
+- Local content extraction is strongest for text files such as `.sv`, `.svh`, `.sva`, `.md`, `.txt`, `.log`, and `.rpt`.
+- Binary formats such as `.pdf`, `.docx`, and `.pptx` are currently indexed mainly by path and filename unless you add a text extraction step.
+- External web search is best-effort and should be treated as a discovery aid, not as a guaranteed structured corpus feed.

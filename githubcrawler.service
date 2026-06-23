@@ -1,5 +1,5 @@
 [Unit]
-Description=GitHub Crawler Supervisor
+Description=Verification Document Crawler Supervisor
 Documentation=https://github.com/Nayab-23/GithubCrawler
 After=network-online.target
 Wants=network-online.target
