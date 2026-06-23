@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the crawler directly on this machine (no SSH, no coordinator).
+# Runs the verification document crawler directly on this machine.
 # Output goes to /tmp/results_local_run.csv — supervisor.py merges it
 # into results_local.csv after each successful run.
 #
@@ -17,11 +17,6 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 else
     echo "[run_local.sh] WARNING: no .env found — relying on exported environment"
-fi
-
-if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "[run_local.sh] ERROR: GITHUB_TOKEN is not set. Aborting."
-    exit 1
 fi
 
 QUERIES_FILE="${QUERIES_FILE:-$SCRIPT_DIR/queries.txt}"

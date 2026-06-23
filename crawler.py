@@ -1,377 +1,518 @@
-import os
-import sys
-import json
 import csv
-import time
-import threading
+import json
+import os
 import re
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
+from html import unescape
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Startup validation
-# ---------------------------------------------------------------------------
-
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-if not GITHUB_TOKEN:
-    print(
-        "ERROR: GITHUB_TOKEN environment variable is not set or is empty.\n"
-        "  Export it before running:  export GITHUB_TOKEN=ghp_...",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
-
-RATE_LIMIT_DELAY  = 2.1   # seconds between every API call
-REQUEST_TIMEOUT   = 30    # seconds before requests.get() gives up
-ENRICH_TIMEOUT    = 60    # seconds before a per-lead enrichment future is abandoned
-
-# ---------------------------------------------------------------------------
-# Logging to crawl.log
-# ---------------------------------------------------------------------------
-
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crawl.log")
-_log_lock = threading.Lock()
-
-
-def _ts():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def log_line(msg):
-    """Append a timestamped line to crawl.log (thread-safe) and echo to stdout."""
-    line = f"[{_ts()}] {msg}"
-    print(line, flush=True)
-    with _log_lock:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Thread-safe rate limiter
-# ---------------------------------------------------------------------------
-
-_rate_lock = threading.Lock()
-_next_call_at = 0.0  # monotonic time before which no new call may fire
-
-
-def rate_limited_get(url, params=None, extra_headers=None):
-    """GET with a global 2.1 s floor between calls, handling 403 rate limits.
-
-    Each thread atomically reserves the next available time slot and then
-    sleeps *outside* the lock so that threads don't pile up blocking one
-    another while sleeping.
-
-    Raises requests.exceptions.Timeout or requests.exceptions.ConnectionError
-    to callers — do not swallow them here so individual functions can decide
-    how to handle them.
-    """
-    global _next_call_at
-
-    headers = dict(HEADERS)
-    if extra_headers:
-        headers.update(extra_headers)
-
-    while True:
-        # Reserve a slot without sleeping under the lock.
-        with _rate_lock:
-            now = time.monotonic()
-            fire_at = max(now, _next_call_at)
-            _next_call_at = fire_at + RATE_LIMIT_DELAY
-
-        wait = fire_at - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-
-        resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-
-        if resp.status_code == 403:
-            reset_ts = resp.headers.get("X-RateLimit-Reset")
-            if reset_ts:
-                sleep_secs = max(int(reset_ts) - int(time.time()), 0) + 5
-                print(f"  [rate limit] 403 received. Sleeping {sleep_secs}s until reset …")
-                time.sleep(sleep_secs)
-                continue
-            else:
-                print(f"  [warn] 403 with no X-RateLimit-Reset header for {url}")
-                return resp
-
-        return resp
-
-
-# ---------------------------------------------------------------------------
-# Search helpers
-# ---------------------------------------------------------------------------
-
-BOT_PATTERN = re.compile(
-    r"(bot|ci|auto|dependabot|renovate|github-actions)",
-    re.IGNORECASE,
-)
-
-CSV_FIELDS = [
-    "query", "source_type", "repo", "repo_name", "org", "org_type",
-    "contributor_count", "language", "stars", "username", "display_name",
-    "email", "company", "bio", "location", "github_profile", "linkedin",
-    "twitter", "blog", "commit_message", "commit_url", "commit_date",
+USER_AGENT = os.environ.get(
+    "CRAWLER_USER_AGENT",
+    "Mozilla/5.0 (compatible; VerificationDocCrawler/1.0; +https://example.invalid)",
+).strip()
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
+SEARCH_DELAY_SECONDS = float(os.environ.get("SEARCH_DELAY_SECONDS", "1.0"))
+MAX_WEB_RESULTS_PER_QUERY = int(os.environ.get("MAX_WEB_RESULTS_PER_QUERY", "8"))
+MAX_LOCAL_RESULTS_PER_QUERY = int(os.environ.get("MAX_LOCAL_RESULTS_PER_QUERY", "12"))
+MAX_LOCAL_FILE_BYTES = int(os.environ.get("MAX_LOCAL_FILE_BYTES", str(2 * 1024 * 1024)))
+MIN_PRIORITY_SCORE = int(os.environ.get("MIN_PRIORITY_SCORE", "6"))
+LOCAL_DOC_DIRS = [
+    part.strip()
+    for part in os.environ.get("LOCAL_DOC_DIRS", "").split(",")
+    if part.strip()
 ]
 
+HEADERS = {"User-Agent": USER_AGENT}
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crawl.log")
+_log_lock = threading.Lock()
+_rate_lock = threading.Lock()
+_next_call_at = 0.0
 
-def write_snapshot(leads, output_path):
-    """Persist an incremental CSV snapshot for live monitoring."""
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for lead in leads:
-            writer.writerow({field: lead.get(field, "") for field in CSV_FIELDS})
+CSV_FIELDS = [
+    "query",
+    "source_type",
+    "document_type",
+    "title",
+    "source_name",
+    "source_domain",
+    "url",
+    "local_path",
+    "file_type",
+    "matched_keywords",
+    "snippet",
+    "published_hint",
+    "priority_score",
+    "priority",
+    "query_family",
+    "legacy_key",
+    "repo",
+    "repo_name",
+    "org",
+    "org_type",
+    "contributor_count",
+    "language",
+    "stars",
+    "username",
+    "display_name",
+    "email",
+    "company",
+    "bio",
+    "location",
+    "github_profile",
+    "linkedin",
+    "twitter",
+    "blog",
+    "commit_message",
+    "commit_url",
+    "commit_date",
+]
+
+TEXT_EXTENSIONS = {
+    ".sv",
+    ".svh",
+    ".v",
+    ".vh",
+    ".sva",
+    ".txt",
+    ".md",
+    ".rst",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".log",
+    ".rpt",
+}
+SCAN_EXTENSIONS = TEXT_EXTENSIONS | {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
+
+DOCUMENT_RULES = [
+    ("ieee_systemverilog", (r"\bieee\b", r"\b1800\b", r"\bsystemverilog\b")),
+    ("sva_tutorial", (r"\bsva\b", r"\bassertion", r"\btutorial|\bguide|\btraining")),
+    ("internal_rulebook", (r"\brulebook\b", r"\bguideline\b|\bstyle guide\b|\bcoding standard\b")),
+    ("protocol_spec", (r"\bprotocol\b", r"\bspec\b|\bspecification\b|\bstandard\b")),
+    ("design_spec", (r"\bdesign\b", r"\bspec\b|\bspecification\b|\barchitecture\b")),
+    ("assertion_example", (r"\bassertion", r"\bproperty\b|\bsequence\b|\bchecker\b")),
+    ("formal_log", (r"\bformal\b", r"\blog\b|\bproof\b|\bcounterexample\b")),
+    ("hil_correction", (r"\bhil\b|\bhardware in the loop\b", r"\bfix\b|\bcorrection\b|\bpatch\b")),
+    ("rca_report", (r"\brca\b|\broot cause\b", r"\breport\b|\banalysis\b|\bpostmortem\b")),
+    ("coverage_report", (r"\bcoverage\b", r"\breport\b|\bclosure\b")),
+    ("uvm_reference", (r"\buvm\b", r"\bguide\b|\breference\b|\btutorial\b")),
+    ("verification_plan", (r"\bverification\b", r"\bplan\b|\bstrategy\b")),
+    ("errata", (r"\berrata\b|\bwaiver\b",)),
+]
+
+QUERY_FAMILIES = {
+    "ieee_systemverilog": ("ieee", "1800", "systemverilog"),
+    "sva_tutorial": ("sva", "assertion", "property", "sequence"),
+    "protocol_spec": ("protocol", "spec", "specification", "interface"),
+    "design_spec": ("design", "architecture", "microarchitecture", "block"),
+    "assertion_example": ("assertion", "checker", "property", "prior generated assertions"),
+    "formal_log": ("formal", "proof", "counterexample", "jasper", "vc formal"),
+    "hil_correction": ("hil", "hardware in the loop", "correction", "patch"),
+    "rca_report": ("rca", "root cause", "postmortem", "failure analysis"),
+}
+
+SEARCH_PRESETS = [
+    {"source_name": "general-web", "site": None},
+    {"source_name": "ieee", "site": "ieeexplore.ieee.org"},
+    {"source_name": "verification-academy", "site": "verificationacademy.com"},
+    {"source_name": "accellera", "site": "accellera.org"},
+    {"source_name": "github", "site": "github.com"},
+    {"source_name": "pdf-index", "site": None, "filetype": "pdf"},
+]
+
+STOPWORDS = {
+    "and",
+    "the",
+    "for",
+    "with",
+    "pdf",
+    "guide",
+    "best",
+    "practices",
+    "report",
+    "tutorial",
+    "spec",
+    "specification",
+}
 
 
-def search_commits(query):
-    """Return list of raw lead dicts from commit search."""
-    leads = []
-    url = "https://api.github.com/search/commits"
-    params = {"q": query, "per_page": 30, "page": 1}
-    extra = {"Accept": "application/vnd.github.cloak-preview+json"}
+def _ts() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"  [commits] searching: {query}")
+
+def log_line(message: str) -> None:
+    line = f"[{_ts()}] {message}"
+    print(line, flush=True)
+    with _log_lock:
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+def rate_limited_get(url: str, params: dict[str, str] | None = None) -> requests.Response:
+    global _next_call_at
+    with _rate_lock:
+        now = time.monotonic()
+        fire_at = max(now, _next_call_at)
+        _next_call_at = fire_at + SEARCH_DELAY_SECONDS
+    wait = fire_at - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    return requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+
+
+def text_to_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9_+\-/.#]+", (text or "").lower())
+
+
+def matched_keywords(text: str, query: str) -> list[str]:
+    haystack = f"{text} {query}".lower()
+    words = []
+    for token in text_to_words(query):
+        if len(token) >= 3 and token in haystack and token not in words:
+            words.append(token)
+    return words[:8]
+
+
+def query_terms(query: str) -> list[str]:
+    return [token for token in text_to_words(query) if len(token) >= 3 and token not in STOPWORDS]
+
+
+def is_relevant_result(query: str, title: str, snippet: str, link: str, site: str | None) -> bool:
+    text = f"{title} {snippet} {link}".lower()
+    terms = query_terms(query)
+    hits = sum(1 for token in terms if token in text)
+    if site and site not in source_domain_from_url(link):
+        return False
+    if "systemverilog" in query.lower() and "systemverilog" not in text and "sva" not in text:
+        return False
+    if "formal" in query.lower() and "formal" not in text and "counterexample" not in text and "proof" not in text:
+        return False
+    return hits >= 2
+
+
+def classify_query(query: str) -> str:
+    lowered = query.lower()
+    for family, terms in QUERY_FAMILIES.items():
+        if any(term in lowered for term in terms):
+            return family
+    return "verification_misc"
+
+
+def classify_document(text: str, domain: str, file_type: str) -> str:
+    lowered = f"{text} {domain} {file_type}".lower()
+    for doc_type, patterns in DOCUMENT_RULES:
+        if all(re.search(pattern, lowered) for pattern in patterns):
+            return doc_type
+    if "ieeexplore.ieee.org" in domain and "systemverilog" in lowered:
+        return "ieee_systemverilog"
+    if file_type in {"sv", "svh", "sva"} and re.search(r"\bassert", lowered):
+        return "assertion_example"
+    if file_type in {"log", "rpt"} and "formal" in lowered:
+        return "formal_log"
+    return "verification_misc"
+
+
+def normalize_title(raw: str, fallback: str) -> str:
+    title = re.sub(r"\s+", " ", unescape(raw or "")).strip()
+    return title or fallback
+
+
+def file_type_from_name(path_or_url: str) -> str:
+    parsed = urlparse(path_or_url)
+    candidate = parsed.path if parsed.scheme else path_or_url
+    suffix = Path(candidate).suffix.lower().lstrip(".")
+    return suffix or "html"
+
+
+def source_domain_from_url(url: str) -> str:
     try:
-        resp = rate_limited_get(url, params=params, extra_headers=extra)
-    except requests.exceptions.Timeout:
-        print(f"  [warn] commit search timed out for query: {query}")
-        return leads
-    except requests.exceptions.ConnectionError as exc:
-        print(f"  [warn] commit search connection error for query '{query}': {exc}")
-        return leads
-
-    if not resp.ok:
-        print(f"  [warn] commit search failed ({resp.status_code}): {resp.text[:200]}")
-        return leads
-
-    items = resp.json().get("items", [])
-    print(f"  [commits] got {len(items)} results")
-
-    for item in items:
-        repo_full = item.get("repository", {}).get("full_name", "")
-        author = (item.get("author") or {}).get("login", "")
-        committer = (item.get("committer") or {}).get("login", "")
-        username = author or committer
-        if not username or not repo_full:
-            continue
-
-        commit_data = item.get("commit", {})
-        message = commit_data.get("message", "")[:200]
-        commit_url = item.get("html_url", "")
-        commit_date = (commit_data.get("author") or {}).get("date", "")
-
-        leads.append({
-            "query": query,
-            "source_type": "commit",
-            "repo": repo_full,
-            "username": username,
-            "commit_message": message,
-            "commit_url": commit_url,
-            "commit_date": commit_date,
-        })
-
-    return leads
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
 
 
-def search_issues(query):
-    """Return list of raw lead dicts from issues/PR search."""
-    leads = []
-    url = "https://api.github.com/search/issues"
-    params = {"q": query, "per_page": 30, "page": 1}
+def score_document(result: dict[str, str]) -> int:
+    score = 0
+    doc_type = result.get("document_type", "")
+    file_type = result.get("file_type", "")
+    domain = result.get("source_domain", "")
+    keyword_count = len((result.get("matched_keywords") or "").split(", ")) if result.get("matched_keywords") else 0
 
-    print(f"  [issues]  searching: {query}")
+    doc_type_weights = {
+        "ieee_systemverilog": 5,
+        "protocol_spec": 5,
+        "design_spec": 4,
+        "formal_log": 4,
+        "assertion_example": 4,
+        "sva_tutorial": 3,
+        "internal_rulebook": 3,
+        "hil_correction": 3,
+        "rca_report": 3,
+        "coverage_report": 2,
+        "verification_plan": 2,
+    }
+    score += doc_type_weights.get(doc_type, 1)
+
+    if domain in {"ieeexplore.ieee.org", "standards.ieee.org"}:
+        score += 4
+    elif domain in {"verificationacademy.com", "accellera.org", "github.com"}:
+        score += 2
+
+    if file_type in {"pdf", "sv", "svh", "sva", "log", "rpt"}:
+        score += 2
+    if result.get("source_type") == "local_file":
+        score += 3
+
+    score += min(keyword_count, 4)
+    return score
+
+
+def priority_label(score: int) -> str:
+    if score >= 11:
+        return "P1"
+    if score >= 7:
+        return "P2"
+    return "P3"
+
+
+def write_snapshot(rows: Iterable[dict[str, str]], output_path: str) -> None:
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+
+def to_row(
+    *,
+    query: str,
+    source_type: str,
+    title: str,
+    source_name: str,
+    source_domain: str,
+    url: str = "",
+    local_path: str = "",
+    file_type: str = "",
+    snippet: str = "",
+    published_hint: str = "",
+) -> dict[str, str]:
+    doc_type = classify_document(f"{title} {snippet}", source_domain, file_type)
+    keywords = matched_keywords(f"{title} {snippet} {local_path} {url}", query)
+    family = classify_query(query)
+    legacy_key = url or local_path or f"{source_name}:{title}"
+    row = {
+        "query": query,
+        "source_type": source_type,
+        "document_type": doc_type,
+        "title": title,
+        "source_name": source_name,
+        "source_domain": source_domain,
+        "url": url,
+        "local_path": local_path,
+        "file_type": file_type,
+        "matched_keywords": ", ".join(keywords),
+        "snippet": snippet.strip(),
+        "published_hint": published_hint,
+        "query_family": family,
+        "legacy_key": legacy_key,
+        "repo": source_domain or source_name,
+        "repo_name": title,
+        "org": source_name,
+        "org_type": source_type,
+        "contributor_count": "",
+        "language": doc_type,
+        "stars": "",
+        "username": source_name,
+        "display_name": title,
+        "email": "",
+        "company": source_domain,
+        "bio": snippet[:280],
+        "location": local_path,
+        "github_profile": url if source_domain == "github.com" else "",
+        "linkedin": "",
+        "twitter": "",
+        "blog": local_path,
+        "commit_message": snippet[:200] or title[:200],
+        "commit_url": url,
+        "commit_date": published_hint or _ts(),
+    }
+    score = score_document(row)
+    row["priority_score"] = str(score)
+    row["priority"] = priority_label(score)
+    return row
+
+
+def search_bing_rss(query: str, source_name: str, site: str | None, filetype: str | None) -> list[dict[str, str]]:
+    q = query
+    if site:
+        q = f"{q} site:{site}"
+    if filetype:
+        q = f"{q} filetype:{filetype}"
+    url = "https://www.bing.com/search"
+    params = {"q": q, "format": "rss"}
     try:
         resp = rate_limited_get(url, params=params)
-    except requests.exceptions.Timeout:
-        print(f"  [warn] issue search timed out for query: {query}")
-        return leads
-    except requests.exceptions.ConnectionError as exc:
-        print(f"  [warn] issue search connection error for query '{query}': {exc}")
-        return leads
-
+    except requests.RequestException as exc:
+        log_line(f"web_search_failed source={source_name} query={json.dumps(query)} error={exc}")
+        return []
     if not resp.ok:
-        print(f"  [warn] issue search failed ({resp.status_code}): {resp.text[:200]}")
-        return leads
+        log_line(
+            f"web_search_failed source={source_name} query={json.dumps(query)} status={resp.status_code}"
+        )
+        return []
 
-    items = resp.json().get("items", [])
-    print(f"  [issues]  got {len(items)} results")
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError as exc:
+        log_line(f"web_search_parse_failed source={source_name} query={json.dumps(query)} error={exc}")
+        return []
 
-    for item in items:
-        html_url = item.get("html_url", "")
-        repo_url = item.get("repository_url", "")
-        repo_full = "/".join(repo_url.split("/")[-2:]) if repo_url else ""
-        username = (item.get("user") or {}).get("login", "")
-        if not username or not repo_full:
+    rows = []
+    for item in root.findall("./channel/item"):
+        title = normalize_title(item.findtext("title", default=""), "Untitled result")
+        link = (item.findtext("link", default="") or "").strip()
+        snippet = normalize_title(item.findtext("description", default=""), "")
+        if not link:
             continue
+        if not is_relevant_result(query, title, snippet, link, site):
+            continue
+        domain = source_domain_from_url(link)
+        rows.append(
+            to_row(
+                query=query,
+                source_type="web_result",
+                title=title,
+                source_name=source_name,
+                source_domain=domain,
+                url=link,
+                file_type=file_type_from_name(link),
+                snippet=snippet,
+            )
+        )
+        if len(rows) >= MAX_WEB_RESULTS_PER_QUERY:
+            break
+    log_line(f'web_search source="{source_name}" query="{query}" results={len(rows)}')
+    return rows
 
-        source_type = "pr" if "/pull/" in html_url else "issue"
 
-        leads.append({
-            "query": query,
-            "source_type": source_type,
-            "repo": repo_full,
-            "username": username,
-            "commit_message": item.get("title", "")[:200],
-            "commit_url": html_url,
-            "commit_date": item.get("created_at", ""),
-        })
-
-    return leads
-
-
-# ---------------------------------------------------------------------------
-# Enrichment helpers
-# ---------------------------------------------------------------------------
-
-def enrich_user(username):
-    """Fetch GitHub profile data for a username. Returns {} on any network error."""
-    url = f"https://api.github.com/users/{username}"
+def read_local_text(path: Path) -> str:
+    if path.suffix.lower() not in TEXT_EXTENSIONS:
+        return ""
+    if path.stat().st_size > MAX_LOCAL_FILE_BYTES:
+        return ""
     try:
-        resp = rate_limited_get(url)
-    except requests.exceptions.Timeout:
-        print(f"  [warn] user enrich timed out: {username}")
-        return {}
-    except requests.exceptions.ConnectionError as exc:
-        print(f"  [warn] user enrich connection error for {username}: {exc}")
-        return {}
-
-    if not resp.ok:
-        print(f"  [warn] user enrichment failed for {username} ({resp.status_code})")
-        return {}
-
-    data = resp.json()
-    blog = data.get("blog") or ""
-    linkedin = blog if "linkedin.com" in blog.lower() else ""
-
-    return {
-        "display_name": data.get("name") or "",
-        "email": data.get("email") or "",
-        "company": data.get("company") or "",
-        "bio": data.get("bio") or "",
-        "location": data.get("location") or "",
-        "github_profile": data.get("html_url") or "",
-        "twitter": data.get("twitter_username") or "",
-        "blog": blog,
-        "linkedin": linkedin,
-    }
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
 
 
-def _parse_contributor_count(resp):
-    """
-    Use the Link header rel=last trick to get contributor count.
-    Falls back to counting the returned list if Link header is absent.
-    """
-    link_header = resp.headers.get("Link", "")
-    if link_header:
-        match = re.search(r'page=(\d+)>;\s*rel="last"', link_header)
-        if match:
-            last_page = int(match.group(1))
-            return last_page * 30
+def search_local_docs(query: str) -> list[dict[str, str]]:
+    if not LOCAL_DOC_DIRS:
+        return []
 
-    try:
-        return len(resp.json())
-    except Exception:
-        return 0
+    query_tokens = [token for token in text_to_words(query) if len(token) >= 3]
+    rows: list[dict[str, str]] = []
 
+    for root_dir in LOCAL_DOC_DIRS:
+        root = Path(root_dir).expanduser()
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in SCAN_EXTENSIONS:
+                continue
 
-def enrich_repo(repo_full):
-    """Fetch repo metadata and contributor count. Returns {} on any network error."""
-    repo_url = f"https://api.github.com/repos/{repo_full}"
-    try:
-        resp = rate_limited_get(repo_url)
-    except requests.exceptions.Timeout:
-        print(f"  [warn] repo enrich timed out: {repo_full}")
-        return {}
-    except requests.exceptions.ConnectionError as exc:
-        print(f"  [warn] repo enrich connection error for {repo_full}: {exc}")
-        return {}
+            file_type = file_type_from_name(str(path))
+            haystack_parts = [str(path.name), str(path)]
+            body = read_local_text(path)
+            if body:
+                haystack_parts.append(body[:20000])
+            haystack = " ".join(haystack_parts).lower()
+            hits = [token for token in query_tokens if token in haystack]
+            if not hits:
+                continue
 
-    if not resp.ok:
-        print(f"  [warn] repo enrichment failed for {repo_full} ({resp.status_code})")
-        return {}
+            snippet = ""
+            if body:
+                for line in body.splitlines():
+                    candidate = line.strip()
+                    if candidate and any(token in candidate.lower() for token in hits):
+                        snippet = candidate[:240]
+                        break
+            rows.append(
+                to_row(
+                    query=query,
+                    source_type="local_file",
+                    title=path.name,
+                    source_name="local-docs",
+                    source_domain="local",
+                    local_path=str(path),
+                    file_type=file_type,
+                    snippet=snippet,
+                    published_hint=datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            )
 
-    data = resp.json()
-    owner = data.get("owner") or {}
-    org = owner.get("login") or ""
-    org_type = owner.get("type") or ""
-    repo_name = data.get("name") or ""
-    description = data.get("description") or ""
-    language = data.get("language") or ""
-    stars = data.get("stargazers_count") or 0
-
-    contributor_count = 0
-    contrib_url = f"https://api.github.com/repos/{repo_full}/contributors"
-    try:
-        contrib_resp = rate_limited_get(contrib_url, params={"per_page": 30, "anon": "true"})
-        if contrib_resp.ok:
-            contributor_count = _parse_contributor_count(contrib_resp)
-    except requests.exceptions.Timeout:
-        print(f"  [warn] contributor fetch timed out: {repo_full}")
-    except requests.exceptions.ConnectionError as exc:
-        print(f"  [warn] contributor fetch connection error for {repo_full}: {exc}")
-
-    return {
-        "repo_name": repo_name,
-        "org": org,
-        "org_type": org_type,
-        "language": language,
-        "stars": stars,
-        "description": description,
-        "contributor_count": contributor_count,
-    }
+    rows.sort(key=lambda row: int(row["priority_score"]), reverse=True)
+    limited = rows[:MAX_LOCAL_RESULTS_PER_QUERY]
+    log_line(f'local_search query="{query}" results={len(limited)} roots={len(LOCAL_DOC_DIRS)}')
+    return limited
 
 
-# ---------------------------------------------------------------------------
-# Filtering
-# ---------------------------------------------------------------------------
-
-def should_filter_out(lead):
-    username = lead.get("username", "")
-    contributor_count = lead.get("contributor_count", 0)
-
-    if BOT_PATTERN.search(username):
-        return True
-    if contributor_count < 3 or contributor_count > 500:
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Core enrichment worker
-# ---------------------------------------------------------------------------
-
-def enrich_lead(lead):
-    """Enrich a single lead with user + repo data. Returns updated lead dict."""
-    username = lead["username"]
-    repo = lead["repo"]
-
-    print(f"  [enrich] {username} @ {repo}")
-
-    user_data = enrich_user(username)
-    repo_data = enrich_repo(repo)
-
-    lead.update(user_data)
-    lead.update(repo_data)
-    return lead
+def dedupe_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict[str, str]] = []
+    for row in rows:
+        key = (
+            (row.get("query") or "").strip(),
+            (row.get("url") or "").strip(),
+            (row.get("local_path") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def crawl_query(query: str) -> list[dict[str, str]]:
+    rows = []
+    for preset in SEARCH_PRESETS:
+        rows.extend(
+            search_bing_rss(
+                query=query,
+                source_name=preset["source_name"],
+                site=preset.get("site"),
+                filetype=preset.get("filetype"),
+            )
+        )
+    rows.extend(search_local_docs(query))
+    rows = dedupe_rows(rows)
+    rows = [row for row in rows if int(row["priority_score"]) >= MIN_PRIORITY_SCORE]
+    rows.sort(key=lambda row: int(row["priority_score"]), reverse=True)
+    return rows
 
-def main():
+
+def main() -> None:
     if len(sys.argv) != 3:
         print("Usage: python crawler.py '<json_query_array>' <output_csv>", file=sys.stderr)
         sys.exit(1)
@@ -383,91 +524,34 @@ def main():
         sys.exit(1)
 
     output_path = sys.argv[2]
-
-    print(f"=== GitHub Crawler starting ===")
-    print(f"  Queries : {len(queries)}")
-    print(f"  Output  : {output_path}")
-    print(f"  Log     : {LOG_PATH}")
+    print("=== Verification Document Crawler starting ===")
+    print(f"  Queries        : {len(queries)}")
+    print(f"  Output         : {output_path}")
+    print(f"  Local doc dirs : {', '.join(LOCAL_DOC_DIRS) if LOCAL_DOC_DIRS else '(none)'}")
+    print(f"  Log            : {LOG_PATH}")
     print()
 
-    # ------------------------------------------------------------------
-    # Phase 1: Search — log after every query completes
-    # ------------------------------------------------------------------
-    raw_leads = []
+    all_rows: list[dict[str, str]] = []
     for query in queries:
-        commit_leads = search_commits(query)
-        issue_leads  = search_issues(query)
-        raw_leads.extend(commit_leads)
-        raw_leads.extend(issue_leads)
-        write_snapshot(raw_leads, output_path)
-        log_line(
-            f'query="{query}" commits={len(commit_leads)} issues={len(issue_leads)}'
-        )
+        rows = crawl_query(query)
+        all_rows.extend(rows)
+        unique_rows = dedupe_rows(all_rows)
+        write_snapshot(unique_rows, output_path)
+        log_line(f'query_complete query="{query}" rows={len(rows)} cumulative={len(unique_rows)}')
 
-    print(f"\n[phase 1] collected {len(raw_leads)} raw leads")
+    final_rows = dedupe_rows(all_rows)
+    final_rows.sort(key=lambda row: int(row["priority_score"]), reverse=True)
+    write_snapshot(final_rows, output_path)
 
-    # ------------------------------------------------------------------
-    # Phase 2: Deduplicate by (username, repo)
-    # ------------------------------------------------------------------
-    seen = {}
-    for lead in raw_leads:
-        key = (lead["username"], lead["repo"])
-        if key not in seen:
-            seen[key] = lead
-
-    unique_leads = list(seen.values())
-    print(f"[phase 2] {len(unique_leads)} unique leads after deduplication\n")
-
-    # ------------------------------------------------------------------
-    # Phase 3: Enrich (threaded, rate-limited, per-future timeout)
-    # ------------------------------------------------------------------
-    print("[phase 3] enriching leads …")
-    enriched = []
-    skipped  = 0
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(enrich_lead, lead): lead for lead in unique_leads}
-        for future in as_completed(futures):
-            lead = futures[future]
-            try:
-                result = future.result(timeout=ENRICH_TIMEOUT)
-                enriched.append(result)
-                filtered_snapshot = [item for item in enriched if not should_filter_out(item)]
-                write_snapshot(filtered_snapshot, output_path)
-            except FutureTimeoutError:
-                skipped += 1
-                print(
-                    f"  [warn] enrichment timed out after {ENRICH_TIMEOUT}s — "
-                    f"skipping {lead.get('username')} @ {lead.get('repo')}"
-                )
-            except Exception as exc:
-                skipped += 1
-                print(f"  [error] enrichment exception: {exc}")
-
-    print(f"\n[phase 3] enriched {len(enriched)} leads, skipped {skipped}")
-
-    # ------------------------------------------------------------------
-    # Phase 4: Filter
-    # ------------------------------------------------------------------
-    filtered = [l for l in enriched if not should_filter_out(l)]
-    print(f"[phase 4] {len(filtered)} leads after filtering "
-          f"(removed {len(enriched) - len(filtered)})\n")
-
-    # ------------------------------------------------------------------
-    # Phase 5: Write CSV
-    # ------------------------------------------------------------------
-    write_snapshot(filtered, output_path)
-
-    print(f"[done] wrote {len(filtered)} leads to {output_path}")
-
-    # ------------------------------------------------------------------
-    # Final log entry
-    # ------------------------------------------------------------------
-    log_line(f"CRAWL COMPLETE total_leads={len(filtered)}")
+    print(f"[done] wrote {len(final_rows)} results to {output_path}")
+    log_line(f"CRAWL COMPLETE total_rows={len(final_rows)}")
 
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
-        print("=== TEST MODE: single query 'fix merge conflict' → /tmp/test_output.csv ===")
-        sys.argv = [sys.argv[0], '["fix merge conflict"]', "/tmp/test_output.csv"]
+        sys.argv = [
+            sys.argv[0],
+            json.dumps(["IEEE 1800 SystemVerilog SVA tutorial", "formal verification counterexample log"]),
+            "/tmp/test_output.csv",
+        ]
     main()

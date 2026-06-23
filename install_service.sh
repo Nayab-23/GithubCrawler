@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs and starts the githubcrawler systemd service.
+# Installs and starts the verification document crawler systemd service.
 # Run once on the Pi from ~/GithubCrawler:
 #
 #   chmod +x install_service.sh
@@ -14,7 +14,7 @@ VENV="/home/nayab/GithubCrawler/.venv"
 ENV_FILE="/home/nayab/GithubCrawler/.env"
 SUPERVISOR="/home/nayab/GithubCrawler/supervisor.py"
 
-echo "=== GitHub Crawler — systemd install ==="
+echo "=== Verification Document Crawler — systemd install ==="
 echo ""
 
 # ── pre-flight checks ──────────────────────────────────────────────────────

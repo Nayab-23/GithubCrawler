@@ -23,11 +23,11 @@ def require_env(key):
 
 
 PC_IPS        = [ip.strip() for ip in require_env("PC_IPS").split(",") if ip.strip()]
-GITHUB_TOKENS = [t.strip()  for t  in require_env("GITHUB_TOKENS").split(",") if t.strip()]
 PC_USER       = os.environ.get("PC_USER", "student").strip()
 QUERIES_FILE  = os.environ.get("QUERIES_FILE", "./queries.txt").strip()
 RESULTS_DIR   = os.environ.get("RESULTS_DIR",  "./results").strip()
 OUTPUT_FILE   = os.environ.get("OUTPUT_FILE",  "./final_leads.csv").strip()
+LOCAL_DOC_DIRS = os.environ.get("LOCAL_DOC_DIRS", "").strip()
 
 CRAWLER_LOCAL  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crawler.py")
 CRAWLER_REMOTE = "/tmp/crawler.py"
@@ -121,7 +121,7 @@ def split_queries(queries, n):
 # Per-PC worker
 # ---------------------------------------------------------------------------
 
-def run_pc(ip, token, queries, results_dir, status):
+def run_pc(ip, queries, results_dir, status):
     """
     Full lifecycle for one PC:
       1. SCP crawler.py
@@ -133,6 +133,7 @@ def run_pc(ip, token, queries, results_dir, status):
     """
     local_csv = os.path.join(results_dir, f"results_{ip}.csv")
     queries_json = json.dumps(queries)
+    local_doc_dirs_escaped = LOCAL_DOC_DIRS.replace("'", "'\"'\"'")
 
     def update(state, detail=""):
         status[ip] = {"state": state, "detail": detail}
@@ -152,12 +153,8 @@ def run_pc(ip, token, queries, results_dir, status):
     # Escape any single quotes inside the JSON so the shell single-quote
     # wrapper is never broken (replace ' with '"'"').
     queries_json_escaped = queries_json.replace("'", "'\"'\"'")
-    remote_cmd = (
-        f"GITHUB_TOKEN={token} "
-        f"python3 {CRAWLER_REMOTE} "
-        f"'{queries_json_escaped}' "
-        f"{REMOTE_CSV}"
-    )
+    env_prefix = f"LOCAL_DOC_DIRS='{local_doc_dirs_escaped}' " if LOCAL_DOC_DIRS else ""
+    remote_cmd = f"{env_prefix}python3 {CRAWLER_REMOTE} '{queries_json_escaped}' {REMOTE_CSV}"
     proc = subprocess.Popen(
         ssh_cmd(ip, remote_cmd),
         stdout=subprocess.PIPE,
@@ -207,17 +204,9 @@ def run_pc(ip, token, queries, results_dir, status):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Validate token count matches PC count
-    if len(GITHUB_TOKENS) != len(PC_IPS):
-        log(
-            f"ERROR: GITHUB_TOKENS has {len(GITHUB_TOKENS)} entries but "
-            f"PC_IPS has {len(PC_IPS)}. They must match."
-        )
-        sys.exit(1)
-
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    log("=== GitHub Crawler Coordinator ===")
+    log("=== Verification Document Crawler Coordinator ===")
     log(f"  PCs         : {', '.join(PC_IPS)}")
     log(f"  SSH user    : {PC_USER}")
     log(f"  Queries     : {QUERIES_FILE}")
@@ -237,13 +226,13 @@ def main():
     # Shared status dict, updated by threads (GIL protects simple dict writes)
     status = {ip: {"state": "pending", "detail": ""} for ip in PC_IPS}
 
-    def worker(ip, token, queries):
-        run_pc(ip, token, queries, RESULTS_DIR, status)
+    def worker(ip, queries):
+        run_pc(ip, queries, RESULTS_DIR, status)
 
     # Launch all PC workers in parallel
     threads = []
-    for ip, token, chunk in zip(PC_IPS, GITHUB_TOKENS, chunks):
-        t = threading.Thread(target=worker, args=(ip, token, chunk), daemon=True)
+    for ip, chunk in zip(PC_IPS, chunks):
+        t = threading.Thread(target=worker, args=(ip, chunk), daemon=True)
         t.start()
         threads.append(t)
 
